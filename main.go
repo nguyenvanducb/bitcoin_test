@@ -1,33 +1,124 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		// Cho phép mọi origin (hoặc tự cấu hình theo yêu cầu)
-		return true
-	},
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+type Client struct {
+	conn *websocket.Conn
+	send chan []byte
+}
+
+type SymbolHub struct {
+	symbol        string
+	clients       map[*Client]bool
+	mu            sync.Mutex
+	binanceConn   *websocket.Conn
+	register      chan *Client
+	unregister    chan *Client
+	started       bool
+	klineInterval string
+}
+
+var hubs = make(map[string]*SymbolHub)
+var hubsMu sync.Mutex
+
+func getOrCreateHub(symbol string, interval string) *SymbolHub {
+	key := symbol + "_" + interval
+	hubsMu.Lock()
+	defer hubsMu.Unlock()
+
+	if hub, ok := hubs[key]; ok {
+		return hub
+	}
+
+	hub := &SymbolHub{
+		symbol:        symbol,
+		klineInterval: interval,
+		clients:       make(map[*Client]bool),
+		register:      make(chan *Client),
+		unregister:    make(chan *Client),
+	}
+	hubs[key] = hub
+	go hub.run()
+	return hub
+}
+
+func (hub *SymbolHub) run() {
+	go hub.connectBinance()
+
+	for {
+		select {
+		case client := <-hub.register:
+			hub.mu.Lock()
+			hub.clients[client] = true
+			hub.mu.Unlock()
+
+		case client := <-hub.unregister:
+			hub.mu.Lock()
+			if _, ok := hub.clients[client]; ok {
+				delete(hub.clients, client)
+				close(client.send)
+			}
+			hub.mu.Unlock()
+		}
+	}
+}
+
+func (hub *SymbolHub) connectBinance() {
+	symbolLower := strings.ToLower(hub.symbol)
+	streams := []string{
+		symbolLower + "@ticker",
+		symbolLower + "@depth20@100ms",
+		symbolLower + "@trade",
+		symbolLower + "@kline_" + hub.klineInterval,
+	}
+	url := "wss://stream.binance.com:9443/stream?streams=" + strings.Join(streams, "/")
+
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		log.Println("Error connecting to Binance:", err)
+		return
+	}
+	hub.binanceConn = conn
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			log.Println("Binance read error:", err)
+			return
+		}
+
+		hub.mu.Lock()
+		for client := range hub.clients {
+			select {
+			case client.send <- msg:
+			default:
+				close(client.send)
+				delete(hub.clients, client)
+			}
+		}
+		hub.mu.Unlock()
+	}
 }
 
 func proxyWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Nâng cấp HTTP -> WebSocket
-	clientConn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("Upgrade error:", err)
 		return
 	}
-	defer clientConn.Close()
 
-	// Đọc các tham số ví dụ ?symbol=btcusdt&interval=1m
 	query := r.URL.Query()
-	fmt.Print(query)
 	symbol := query.Get("symbol")
 	if symbol == "" {
 		symbol = "btcusdt"
@@ -37,45 +128,31 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request) {
 		interval = "1m"
 	}
 
-	symbolLower := strings.ToLower(symbol)
-	streams := []string{
-		symbolLower + "@ticker",
-		symbolLower + "@depth20@100ms",
-		symbolLower + "@trade",
-		symbolLower + "@kline_" + interval,
+	hub := getOrCreateHub(symbol, interval)
+	client := &Client{
+		conn: conn,
+		send: make(chan []byte, 256),
 	}
-	url := "wss://stream.binance.com:9443/stream?streams=" + strings.Join(streams, "/")
+	hub.register <- client
 
-	// Kết nối đến Binance
-	binanceConn, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		log.Println("Error connecting to Binance:", err)
-		return
-	}
-	defer binanceConn.Close()
-
-	// Chuyển tiếp dữ liệu từ Binance về client
 	go func() {
-		for {
-			_, msg, err := binanceConn.ReadMessage()
+		for msg := range client.send {
+			err := client.conn.WriteMessage(websocket.TextMessage, msg)
 			if err != nil {
-				log.Println("Binance read error:", err)
-				clientConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-				return
+				break
 			}
-			clientConn.WriteMessage(websocket.TextMessage, msg)
 		}
+		client.conn.Close()
 	}()
 
-	// (Tuỳ chọn) Nhận dữ liệu từ client gửi đi Binance
 	for {
-		_, msg, err := clientConn.ReadMessage()
+		_, _, err := client.conn.ReadMessage()
 		if err != nil {
-			log.Println("Client read error:", err)
-			return
+			break
 		}
-		binanceConn.WriteMessage(websocket.TextMessage, msg)
 	}
+
+	hub.unregister <- client
 }
 
 func main() {
