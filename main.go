@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 var upgrader = websocket.Upgrader{
@@ -25,12 +29,15 @@ type SymbolHub struct {
 	binanceConn   *websocket.Conn
 	register      chan *Client
 	unregister    chan *Client
-	started       bool
 	klineInterval string
 }
 
 var hubs = make(map[string]*SymbolHub)
 var hubsMu sync.Mutex
+
+// MongoDB client and collection
+var mongoClient *mongo.Client
+var mongoCollection *mongo.Collection
 
 func getOrCreateHub(symbol string, interval string) *SymbolHub {
 	key := symbol + "_" + interval
@@ -98,6 +105,22 @@ func (hub *SymbolHub) connectBinance() {
 			return
 		}
 
+		// Ghi log vào MongoDB
+		go func(message []byte) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, err := mongoCollection.InsertOne(ctx, map[string]interface{}{
+				"symbol":    hub.symbol,
+				"interval":  hub.klineInterval,
+				"timestamp": time.Now(),
+				"message":   string(message),
+			})
+			if err != nil {
+				log.Println("MongoDB insert error:", err)
+			}
+		}(msg)
+
+		// Gửi dữ liệu đến tất cả client đang kết nối
 		hub.mu.Lock()
 		for client := range hub.clients {
 			select {
@@ -135,6 +158,7 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	hub.register <- client
 
+	// Gửi dữ liệu tới client
 	go func() {
 		for msg := range client.send {
 			err := client.conn.WriteMessage(websocket.TextMessage, msg)
@@ -145,6 +169,7 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request) {
 		client.conn.Close()
 	}()
 
+	// Đọc tin nhắn từ client (mặc dù không dùng)
 	for {
 		_, _, err := client.conn.ReadMessage()
 		if err != nil {
@@ -155,11 +180,28 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request) {
 	hub.unregister <- client
 }
 
+func initMongoDB() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+	if err != nil {
+		log.Fatal("MongoDB connection error:", err)
+	}
+
+	// Gán client và collection toàn cục
+	mongoClient = client
+	mongoCollection = client.Database("binance_stream").Collection("messages")
+}
+
 func main() {
+	// Kết nối MongoDB
+	initMongoDB()
+
 	http.HandleFunc("/ws", proxyWebSocket)
 
-	log.Println("WebSocket proxy server started on :8080")
-	err := http.ListenAndServe(":8080", nil)
+	log.Println("WebSocket proxy server started on :8888")
+	err := http.ListenAndServe(":8888", nil)
 	if err != nil {
 		log.Fatal("ListenAndServe error:", err)
 	}
