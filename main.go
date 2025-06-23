@@ -158,8 +158,8 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request) {
 func main() {
 	http.HandleFunc("/ws", proxyWebSocket)
 
-	log.Println("WebSocket proxy server started on :8888")
-	err := http.ListenAndServe(":8888", nil)
+	log.Println("WebSocket proxy server started on :80")
+	err := http.ListenAndServe(":80", nil)
 	if err != nil {
 		log.Fatal("ListenAndServe error:", err)
 	}
